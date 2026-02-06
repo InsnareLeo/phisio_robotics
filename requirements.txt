@@ -10,3 +10,4 @@ scipy
 requests
 tqdm
 seaborn
+torch
