@@ -1,0 +1,8 @@
+streamlit
+opencv-python-headless
+numpy
+pandas
+tensorflow
+torch
+ultralytics
+protobuf<4
