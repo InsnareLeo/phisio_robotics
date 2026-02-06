@@ -10,20 +10,24 @@ import pathlib
 import sys
 import tempfile
 import time
-import cv2  # opencv-python-headless 설치 시 사용 가능
+import cv2  # packages.txt 설치 후 정상 작동함
 from unittest.mock import MagicMock
 
 # ==========================================
 # 0. 시스템 패치 (필수)
 # ==========================================
+# IPython 제거 (YOLOv9 호환)
 sys.modules["IPython"] = MagicMock()
 sys.modules["IPython.display"] = MagicMock()
+
+# Linux(Cloud) 경로 호환
 pathlib.WindowsPath = pathlib.PosixPath
 
-# PyTorch 2.6+ 보안 경고 우회
+# PyTorch 2.6+ 보안 에러 방지 (Weights Only 해제)
 _original_torch_load = torch.load
 def safe_torch_load(*args, **kwargs):
-    if 'weights_only' not in kwargs: kwargs['weights_only'] = False
+    if 'weights_only' not in kwargs:
+        kwargs['weights_only'] = False
     return _original_torch_load(*args, **kwargs)
 torch.load = safe_torch_load
 
@@ -33,7 +37,7 @@ from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
 # ==========================================
 # 1. 환경 설정
 # ==========================================
-st.set_page_config(page_title="Phisio AI Pro (Overlay Fixed)", layout="wide")
+st.set_page_config(page_title="Phisio AI Pro (System Fixed)", layout="wide")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 POSE_MODEL_NAME = os.path.join(BASE_DIR, "yolov8n-pose.pt")
@@ -42,14 +46,16 @@ STICKER_MODEL_PATH = os.path.join(BASE_DIR, 'best.pt')
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-# 큐 설정: img_queue는 최신 프레임 1장만 보관 (캡처용)
+# 큐 설정
 if 'result_queue' not in st.session_state: st.session_state.result_queue = queue.Queue(maxsize=1)
 if 'img_queue' not in st.session_state: st.session_state.img_queue = queue.Queue(maxsize=1)
 
-# 스냅샷 결과 저장용 세션
+# 상태 변수
 if 'snapshot_img' not in st.session_state: st.session_state['snapshot_img'] = None
 if 'snapshot_info' not in st.session_state: st.session_state['snapshot_info'] = None
 if 'side_baseline' not in st.session_state: st.session_state['side_baseline'] = None
+if 'last_kps' not in st.session_state: st.session_state['last_kps'] = None
+if 'load_error' not in st.session_state: st.session_state['load_error'] = None
 
 # ==========================================
 # 2. 모델 로더
@@ -68,7 +74,8 @@ def load_tf_dependencies():
             tf = _tf
             layers = _layers
             models = _models
-        except: st.error("TensorFlow Import Error"); st.stop()
+        except:
+            st.error("TensorFlow Import Error"); st.stop()
 
 def transformer_encoder(inputs, head_size, num_heads, ff_dim, dropout=0.0):
     x = layers.MultiHeadAttention(key_dim=head_size, num_heads=num_heads, dropout=dropout)(inputs, inputs)
@@ -96,12 +103,19 @@ def build_action_model(input_shape, n_classes):
 class StickerProcessorHybrid:
     def __init__(self, weights_path, device=DEVICE):
         self.model = None
+        self.method = None
         try:
+            # v9 시도
             self.model = torch.hub.load('WongKinYiu/yolov9', 'custom', path=weights_path, force_reload=True, trust_repo=True)
-        except:
+            self.method = "YOLOv9"
+        except Exception as e1:
             try:
+                # v5 Fallback 시도
                 self.model = torch.hub.load('ultralytics/yolov5', 'custom', path=weights_path, force_reload=True, trust_repo=True)
-            except: self.model = None
+                self.method = "YOLOv5"
+            except Exception as e2:
+                st.session_state.load_error = f"v9:{e1} / v5:{e2}"
+                self.model = None
 
         if self.model:
             try:
@@ -117,26 +131,24 @@ class StickerProcessorHybrid:
         mid_x = (l_sh[0] + r_sh[0]) / 2
         
         try:
-            # Sticker Inference
-            img_rgb = img_arr[:, :, ::-1]
+            img_rgb = img_arr[:, :, ::-1] # BGR -> RGB
             results = self.model(img_rgb)
             df = results.pandas().xyxy[0]
             candidates = []
             for _, row in df.iterrows():
                 cx, cy = int((row['xmin']+row['xmax'])/2), int((row['ymin']+row['ymax'])/2)
-                # 시각화용 Box 좌표도 저장
                 box = (int(row['xmin']), int(row['ymin']), int(row['xmax']), int(row['ymax']))
                 candidates.append({'center': (cx, cy), 'box': box, 'conf': row['confidence']})
             
-            # Filtering
+            # 중심축 기준 필터링
             valid = [c for c in candidates if abs(c['center'][0] - mid_x) < abs(l_sh[0]-r_sh[0])*0.8]
-            valid.sort(key=lambda x: x['center'][1]) # 상하 정렬
+            valid.sort(key=lambda x: x['center'][1])
             
             return valid, len(valid) >= 2
         except: return [], False
 
 # ==========================================
-# 3. 유틸리티 (Drawing 포함)
+# 3. 유틸리티 (Drawing)
 # ==========================================
 def process_yolo_keypoints_original(kps):
     coords, confs = kps[:, :2].copy(), kps[:, 2:3].copy()
@@ -145,28 +157,21 @@ def process_yolo_keypoints_original(kps):
     coords /= scale_ref; coords[[13,14,15,16]] = 0.0
     return np.hstack([coords, confs]).flatten()
 
-def draw_overlay(img, objs, kps):
-    """이미지 위에 스티커 박스와 척추 라인을 그리는 함수"""
+def draw_overlay(img, objs):
     vis = img.copy()
     pts = [o['center'] for o in objs]
     
-    # 박스 및 번호 그리기
+    # 박스 및 번호
     for i, o in enumerate(objs):
         b = o['box']
         cv2.rectangle(vis, (b[0], b[1]), (b[2], b[3]), (0, 255, 0), 2)
         cv2.putText(vis, str(i+1), (b[0], b[1]-5), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
     
-    # 라인 연결 (척추선)
+    # 라인 연결
     if len(pts) >= 2:
         for i in range(len(pts)-1):
             cv2.line(vis, pts[i], pts[i+1], (255, 255, 0), 2)
-            
     return vis, pts
-
-def angle_between(v1, v2):
-    n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
-    if n1 == 0 or n2 == 0: return 0.0
-    return float(np.degrees(np.arccos(np.clip(np.dot(v1, v2)/(n1*n2), -1.0, 1.0))))
 
 @st.cache_resource
 def load_all_models():
@@ -184,19 +189,20 @@ def load_all_models():
 # ==========================================
 try:
     pm_global, am_global, names_global, sp_global = load_all_models()
-except Exception as e: st.error(f"Error: {e}"); st.stop()
+except Exception as e:
+    st.error(f"모델 초기화 오류: {e}"); st.stop()
 
 def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
     img = frame.to_ndarray(format="bgr24")
     
-    # 1. 캡처용 프레임 저장 (최신 프레임 유지)
+    # 1. 캡처용 최신 프레임 보관
     try:
         if st.session_state.img_queue.full():
             st.session_state.img_queue.get_nowait()
         st.session_state.img_queue.put(img)
     except: pass
     
-    # 2. 실시간 Pose 추론
+    # 2. Pose 추론
     res = pm_global(img, verbose=False, conf=0.1)
     kps = None
     action_text = "Wait..."
@@ -210,64 +216,60 @@ def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
     
     try:
         if kps is not None:
-            if st.session_state.result_queue.full(): st.session_state.result_queue.get_nowait()
+            if st.session_state.result_queue.full():
+                st.session_state.result_queue.get_nowait()
             st.session_state.result_queue.put({'kps': kps, 'action': action_text})
     except: pass
     
     return frame
 
 # ==========================================
-# 5. UI Layout
+# 5. UI 화면
 # ==========================================
 col_main, col_ctrl = st.columns([1.6, 0.4])
 
 with col_ctrl:
-    st.header("⚙️ 제어 패널")
+    st.header("⚙️ 제어")
     
-    # 측정 기능 (스냅샷 & 오버레이)
-    if st.button("📸 Cobb 각도 측정 (Side Baseline)", type="primary", use_container_width=True):
+    if st.button("🛠 모델 상태", use_container_width=True):
+        if sp_global and sp_global.model: st.success("모델 로드 성공")
+        else: st.error(f"실패: {st.session_state.load_error}")
+
+    st.divider()
+
+    # 캡처 및 오버레이 버튼
+    if st.button("📸 Cobb 각도 (Side)", type="primary", use_container_width=True):
         if not st.session_state.img_queue.empty():
-            # 1. 큐에서 이미지 꺼내기
-            capture_img = st.session_state.img_queue.get()
+            capture_img = st.session_state.img_queue.get() # 큐에서 이미지 꺼냄
             
-            # 2. Pose & Sticker 추론
             res = pm_global(capture_img, verbose=False, conf=0.1)
             if res[0].keypoints is not None:
                 kps = res[0].keypoints.data[0].cpu().numpy()
                 objs, success = sp_global.get_spine_points(capture_img, kps)
                 
                 if success:
-                    # 3. 그림 그리기 (Overlay)
-                    vis_img, pts = draw_overlay(capture_img, objs, kps)
-                    
-                    # 4. 각도 계산 (예시)
-                    v_spine = np.array(pts[0]) - np.array(pts[-1])
-                    st.session_state['side_baseline'] = v_spine
-                    
-                    # 5. 결과 저장 (이미지 BGR -> RGB 변환)
+                    # 오버레이 그리기
+                    vis_img, pts = draw_overlay(capture_img, objs)
                     st.session_state['snapshot_img'] = cv2.cvtColor(vis_img, cv2.COLOR_BGR2RGB)
-                    st.session_state['snapshot_info'] = "Cobb 각도: 기준선 저장됨"
+                    st.session_state['snapshot_info'] = "측정 완료"
                 else:
                     st.error("스티커 인식 실패")
             else:
                 st.error("사람 인식 실패")
         else:
-            st.warning("카메라 영상이 없습니다.")
+            st.warning("웹캠 연결 확인 필요")
 
-    st.markdown("---")
-    # 결과 보여주기
+    # 결과 이미지 표시
     if st.session_state['snapshot_img'] is not None:
-        st.image(st.session_state['snapshot_img'], caption=st.session_state.get('snapshot_info', '결과'))
-        
-    st.divider()
-    st.caption("현재 동작:")
-    status_ph = st.empty()
+        st.image(st.session_state['snapshot_img'], caption=st.session_state.get('snapshot_info'))
 
+    st.divider()
+    status_ph = st.empty()
 
 with col_main:
     st.subheader("🎥 실시간 모니터링")
     webrtc_streamer(
-        key="pose-overlay",
+        key="pose-main",
         mode=WebRtcMode.SENDRECV,
         rtc_configuration=RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}),
         video_frame_callback=video_frame_callback,
@@ -275,9 +277,8 @@ with col_main:
         async_processing=True,
     )
     
-    # 실시간 상태 텍스트 업데이트
     if st.session_state.result_queue.not_empty:
         try:
             data = st.session_state.result_queue.get_nowait()
-            status_ph.info(f"**{data['action']}**")
+            status_ph.info(f"동작: **{data['action']}**")
         except: pass
