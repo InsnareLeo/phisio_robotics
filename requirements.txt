@@ -1,7 +1,8 @@
 streamlit
 streamlit-webrtc
-opencv-python-headless==4.8.1.78
-numpy
-av
-torch==2.1.0
+opencv-python-headless
 ultralytics
+tensorflow-cpu
+numpy
+pandas
+av
