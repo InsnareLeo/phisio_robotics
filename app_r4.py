@@ -11,23 +11,22 @@ import sys
 from unittest.mock import MagicMock
 
 # ==========================================
-# [중요] 0. YOLOv9 로딩 오류 방지 (IPython Mocking)
+# 0. 시스템 설정 (IPython Mock & Path)
 # ==========================================
-# YOLOv9 코드가 내부적으로 IPython을 찾을 때, 
-# 설치하지 않아도 있는 것처럼 속여서 에러를 막습니다.
+# YOLO 모델 내부의 불필요한 의존성 제거
 sys.modules["IPython"] = MagicMock()
 sys.modules["IPython.display"] = MagicMock()
 
-# Linux(Cloud)에서 Windows Path 오류 방지
+# Linux(Cloud)에서 Windows 경로 호환성 해결
 pathlib.WindowsPath = pathlib.PosixPath
 
 from ultralytics import YOLO
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
 
 # ==========================================
-# 1. 환경 및 경로 설정
+# 1. 환경 설정
 # ==========================================
-st.set_page_config(page_title="Phisio AI Pro (Cloud/v9)", layout="wide")
+st.set_page_config(page_title="Phisio AI Pro (Final Fix)", layout="wide")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 POSE_MODEL_NAME = os.path.join(BASE_DIR, "yolov8n-pose.pt")
@@ -38,9 +37,11 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 if 'result_queue' not in st.session_state:
     st.session_state.result_queue = queue.Queue(maxsize=1)
+if 'load_error' not in st.session_state:
+    st.session_state.load_error = None
 
 # ==========================================
-# 2. TensorFlow Lazy Loading (앱 멈춤 방지)
+# 2. TensorFlow Lazy Loading
 # ==========================================
 tf = None
 layers = None
@@ -61,7 +62,7 @@ def load_tf_dependencies():
             st.stop()
 
 # ==========================================
-# 3. 모델 클래스 정의
+# 3. 모델 클래스
 # ==========================================
 def transformer_encoder(inputs, head_size, num_heads, ff_dim, dropout=0.0):
     x = layers.MultiHeadAttention(key_dim=head_size, num_heads=num_heads, dropout=dropout)(inputs, inputs)
@@ -86,44 +87,60 @@ def build_action_model(input_shape, n_classes):
     outputs = layers.Dense(n_classes, activation="softmax")(x)
     return models.Model(inputs, outputs)
 
-class StickerProcessorV9:
+class StickerProcessorHybrid:
     def __init__(self, weights_path, device=DEVICE):
-        # [핵심] 원본 코드의 'experimental' 로딩 방식을 Cloud에 맞게 변경
-        # Github에서 코드를 받아오므로 로컬에 'yolov9' 폴더가 없어도 작동함
+        self.model = None
+        self.method = None
+        
+        # [시도 1] YOLOv9 (WongKinYiu) 방식으로 로드 시도
         try:
-            self.model = torch.hub.load('WongKinYiu/yolov9', 'custom', path=weights_path, force_reload=False, trust_repo=True)
-            self.model.conf = 0.15  
-            self.model.iou = 0.45   
-            self.model.eval()       
-            self.model.to(device)
-        except Exception as e:
-            # IPython 에러는 상단의 sys.modules로 해결됨. 
-            # 그 외 에러 발생 시 메시지 출력
-            st.error(f"모델 로드 에러: {e}")
-            self.model = None
+            # force_reload=True로 설정하여 캐시 문제 해결 시도
+            self.model = torch.hub.load('WongKinYiu/yolov9', 'custom', path=weights_path, force_reload=True, trust_repo=True)
+            self.method = "YOLOv9"
+        except Exception as e_v9:
+            print(f"v9 load failed: {e_v9}")
+            st.session_state.load_error = f"v9 실패: {str(e_v9)}"
+            
+            # [시도 2] 실패 시 YOLOv5 (Ultralytics) 방식으로 재시도 (Fallback)
+            # YOLOv9 모델 파일(.pt)은 대부분 YOLOv5 로더와 호환됩니다.
+            try:
+                self.model = torch.hub.load('ultralytics/yolov5', 'custom', path=weights_path, force_reload=True, trust_repo=True)
+                self.method = "YOLOv5-Fallback"
+                # 성공 시 에러 메시지 초기화
+                st.session_state.load_error = None 
+            except Exception as e_v5:
+                # 둘 다 실패한 경우
+                st.session_state.load_error = f"v9실패({str(e_v9)}) / v5실패({str(e_v5)})"
+                self.model = None
+
+        if self.model:
+            try:
+                self.model.conf = 0.15
+                self.model.iou = 0.45
+                self.model.eval()
+                self.model.to(device)
+            except:
+                pass
 
     def get_spine_points(self, img_arr, kps):
         if kps is None or self.model is None: return [], False, "인식 불가"
         
-        # 1. Pose 좌표 추출
         l_sh, r_sh = kps[5][:2], kps[6][:2]
         mid_x = (l_sh[0] + r_sh[0]) / 2
         
-        # 2. YOLOv9 추론 (BGR -> RGB)
         try:
+            # 모델 입력: RGB
             img_rgb = img_arr[:, :, ::-1]
             results = self.model(img_rgb)
             
-            # 3. 결과 파싱 (Pandas DataFrame)
+            # 결과 파싱
             df = results.pandas().xyxy[0] 
-            
             candidates = []
             for _, row in df.iterrows():
                 cx = (row['xmin'] + row['xmax']) / 2
                 cy = (row['ymin'] + row['ymax']) / 2
                 candidates.append({'center': (cx, cy), 'conf': row['confidence']})
             
-            # 4. 필터링 (척추 라인)
             x_tol = abs(l_sh[0] - r_sh[0]) * 0.6
             valid_cands = [c for c in candidates if abs(c['center'][0] - mid_x) < x_tol]
             valid_cands.sort(key=lambda x: x['center'][1])
@@ -136,7 +153,7 @@ class StickerProcessorV9:
             return [], False, f"추론 오류: {e}"
 
 # ==========================================
-# 4. 유틸리티 함수
+# 4. 유틸리티
 # ==========================================
 def process_yolo_keypoints_original(kps):
     coords, confs = kps[:, :2].copy(), kps[:, 2:3].copy()
@@ -147,39 +164,36 @@ def process_yolo_keypoints_original(kps):
 
 @st.cache_resource
 def load_all_models():
-    # TF 지연 로드
     load_tf_dependencies()
     
-    # 모델 빌드
     pm = YOLO(POSE_MODEL_NAME)
+    
     am = build_action_model((30, 51), 5)
     if os.path.exists(ACTION_WEIGHTS_PATH):
         with open(ACTION_WEIGHTS_PATH, "rb") as f: w_list = pickle.load(f)
         am.set_weights([np.array(w) for w in w_list])
     
-    # Sticker Model (v9)
-    sp = StickerProcessorV9(STICKER_MODEL_PATH) if os.path.exists(STICKER_MODEL_PATH) else None
+    # Hybrid Processor 사용
+    sp = StickerProcessorHybrid(STICKER_MODEL_PATH) if os.path.exists(STICKER_MODEL_PATH) else None
     
     return pm, am, ['Sitting (Ready)', 'Forward_Bending', 'Back_Extension', 'Side_Bending', 'Rotation'], sp
 
-# 상태 초기화
 if 'last_kps' not in st.session_state: st.session_state['last_kps'] = None
 if 'last_action' not in st.session_state: st.session_state['last_action'] = "Waiting..."
 if 'calc_result' not in st.session_state: st.session_state['calc_result'] = None
 
 # ==========================================
-# 5. WebRTC 콜백
+# 5. WebRTC
 # ==========================================
 try:
     pm_global, am_global, names_global, sp_global = load_all_models()
 except Exception as e:
-    st.error(f"초기화 실패: {e}")
+    st.error(f"초기화 치명적 오류: {e}")
     st.stop()
 
 def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
     img = frame.to_ndarray(format="bgr24")
     
-    # Pose 추론
     res = pm_global(img, verbose=False, conf=0.1)
     kps = None
     action_text = "No Pose"
@@ -187,7 +201,6 @@ def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
     if res[0].keypoints is not None and len(res[0].keypoints.data) > 0:
         kps = res[0].keypoints.data[0].cpu().numpy()
         
-        # Action 추론
         feat = process_yolo_keypoints_original(kps)
         feat_tensor = np.expand_dims(feat, axis=0)
         input_data = np.tile(feat_tensor, (1, 30, 1)) 
@@ -206,14 +219,14 @@ def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
     return frame
 
 # ==========================================
-# 6. UI 구성
+# 6. UI
 # ==========================================
 col_cam, col_info = st.columns([1.5, 1.0])
 
 with col_cam:
-    st.markdown("### 🎥 웹캠 스트림 (YOLOv9 Support)")
+    st.markdown("### 🎥 웹캠 스트림 (Hybrid Load)")
     webrtc_ctx = webrtc_streamer(
-        key="pose-analysis-v9-fix",
+        key="pose-analysis-hybrid",
         mode=WebRtcMode.SENDRECV,
         rtc_configuration=RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}),
         video_frame_callback=video_frame_callback,
@@ -237,11 +250,16 @@ with col_info:
 
     st.markdown("---")
     
+    # 모델 상태 확인 로직 개선
     if st.button("🛠 모델 상태 재확인", use_container_width=True):
         if sp_global and sp_global.model:
-            st.success("✅ YOLOv9 모델 정상 로드됨 (IPython Mock 적용)")
+            st.success(f"✅ 모델 로드 성공! (방식: {sp_global.method})")
+            st.caption("v9 방식 실패 시 v5 방식으로 자동 전환되었습니다.")
         else:
-            st.error("❌ 여전히 모델 로드 실패. 로그를 확인하세요.")
+            # 정확한 에러 메시지 출력
+            err_msg = st.session_state.load_error if st.session_state.load_error else "알 수 없는 오류"
+            st.error(f"❌ 모델 로드 실패 원인:\n{err_msg}")
+            st.warning("팁: requirements.txt에 'thop'과 'pyyaml'이 있는지 확인하세요.")
 
     if st.button("📸 자세 각도 측정 (Pose 기반)", use_container_width=True):
          if st.session_state['last_kps'] is not None:
