@@ -1,8 +1,7 @@
 streamlit
-opencv-python-headless
+streamlit-webrtc
+opencv-python-headless==4.8.1.78
 numpy
-pandas
-tensorflow
-torch
+av
+torch==2.1.0
 ultralytics
-protobuf<4
