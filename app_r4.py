@@ -10,25 +10,20 @@ import pathlib
 import sys
 import tempfile
 import time
+import cv2  # opencv-python-headless 설치 시 사용 가능
 from unittest.mock import MagicMock
 
 # ==========================================
-# 0. 시스템 호환성 패치 (매우 중요)
+# 0. 시스템 패치 (필수)
 # ==========================================
-
-# 1. IPython 모듈 에러 방지 (YOLOv9 호환)
 sys.modules["IPython"] = MagicMock()
 sys.modules["IPython.display"] = MagicMock()
-
-# 2. Linux(Cloud)에서 Windows Path 에러 방지
 pathlib.WindowsPath = pathlib.PosixPath
 
-# 3. [핵심] PyTorch 2.6+ weights_only 에러 강제 해결
-# torch.hub.load가 내부적으로 torch.load를 호출할 때 보안 검사를 우회하도록 설정
+# PyTorch 2.6+ 보안 경고 우회
 _original_torch_load = torch.load
 def safe_torch_load(*args, **kwargs):
-    if 'weights_only' not in kwargs:
-        kwargs['weights_only'] = False  # 강제로 보안 검사 해제
+    if 'weights_only' not in kwargs: kwargs['weights_only'] = False
     return _original_torch_load(*args, **kwargs)
 torch.load = safe_torch_load
 
@@ -38,7 +33,7 @@ from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
 # ==========================================
 # 1. 환경 설정
 # ==========================================
-st.set_page_config(page_title="Phisio AI Pro (Cloud/Fixed)", layout="wide")
+st.set_page_config(page_title="Phisio AI Pro (Overlay Fixed)", layout="wide")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 POSE_MODEL_NAME = os.path.join(BASE_DIR, "yolov8n-pose.pt")
@@ -47,15 +42,17 @@ STICKER_MODEL_PATH = os.path.join(BASE_DIR, 'best.pt')
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-# 세션 상태 초기화
+# 큐 설정: img_queue는 최신 프레임 1장만 보관 (캡처용)
 if 'result_queue' not in st.session_state: st.session_state.result_queue = queue.Queue(maxsize=1)
-if 'last_kps' not in st.session_state: st.session_state['last_kps'] = None
-if 'last_action' not in st.session_state: st.session_state['last_action'] = "Waiting..."
-if 'load_error' not in st.session_state: st.session_state.load_error = None
-if 'is_processing_video' not in st.session_state: st.session_state['is_processing_video'] = False
+if 'img_queue' not in st.session_state: st.session_state.img_queue = queue.Queue(maxsize=1)
+
+# 스냅샷 결과 저장용 세션
+if 'snapshot_img' not in st.session_state: st.session_state['snapshot_img'] = None
+if 'snapshot_info' not in st.session_state: st.session_state['snapshot_info'] = None
+if 'side_baseline' not in st.session_state: st.session_state['side_baseline'] = None
 
 # ==========================================
-# 2. 모델 로더 (TensorFlow Lazy Load)
+# 2. 모델 로더
 # ==========================================
 tf = None
 layers = None
@@ -71,13 +68,8 @@ def load_tf_dependencies():
             tf = _tf
             layers = _layers
             models = _models
-        except ImportError:
-            st.error("TensorFlow 로드 실패. requirements.txt를 확인하세요.")
-            st.stop()
+        except: st.error("TensorFlow Import Error"); st.stop()
 
-# ==========================================
-# 3. 모델 아키텍처
-# ==========================================
 def transformer_encoder(inputs, head_size, num_heads, ff_dim, dropout=0.0):
     x = layers.MultiHeadAttention(key_dim=head_size, num_heads=num_heads, dropout=dropout)(inputs, inputs)
     x = layers.Dropout(dropout)(x)
@@ -104,19 +96,12 @@ def build_action_model(input_shape, n_classes):
 class StickerProcessorHybrid:
     def __init__(self, weights_path, device=DEVICE):
         self.model = None
-        self.method = None
-        
-        # v9 시도 -> 실패시 v5 시도 (PyTorch 2.6 패치 적용됨)
         try:
             self.model = torch.hub.load('WongKinYiu/yolov9', 'custom', path=weights_path, force_reload=True, trust_repo=True)
-            self.method = "YOLOv9"
-        except Exception as e_v9:
+        except:
             try:
                 self.model = torch.hub.load('ultralytics/yolov5', 'custom', path=weights_path, force_reload=True, trust_repo=True)
-                self.method = "YOLOv5-Fallback"
-            except Exception as e_v5:
-                st.session_state.load_error = f"로드 실패: {e_v9} || {e_v5}"
-                self.model = None
+            except: self.model = None
 
         if self.model:
             try:
@@ -130,21 +115,28 @@ class StickerProcessorHybrid:
         if kps is None or self.model is None: return [], False
         l_sh, r_sh = kps[5][:2], kps[6][:2]
         mid_x = (l_sh[0] + r_sh[0]) / 2
+        
         try:
+            # Sticker Inference
             img_rgb = img_arr[:, :, ::-1]
             results = self.model(img_rgb)
             df = results.pandas().xyxy[0]
             candidates = []
             for _, row in df.iterrows():
-                candidates.append({'center': ((row['xmin']+row['xmax'])/2, (row['ymin']+row['ymax'])/2)})
-            # 간단 필터링
+                cx, cy = int((row['xmin']+row['xmax'])/2), int((row['ymin']+row['ymax'])/2)
+                # 시각화용 Box 좌표도 저장
+                box = (int(row['xmin']), int(row['ymin']), int(row['xmax']), int(row['ymax']))
+                candidates.append({'center': (cx, cy), 'box': box, 'conf': row['confidence']})
+            
+            # Filtering
             valid = [c for c in candidates if abs(c['center'][0] - mid_x) < abs(l_sh[0]-r_sh[0])*0.8]
-            valid.sort(key=lambda x: x['center'][1])
+            valid.sort(key=lambda x: x['center'][1]) # 상하 정렬
+            
             return valid, len(valid) >= 2
         except: return [], False
 
 # ==========================================
-# 4. 유틸리티
+# 3. 유틸리티 (Drawing 포함)
 # ==========================================
 def process_yolo_keypoints_original(kps):
     coords, confs = kps[:, :2].copy(), kps[:, 2:3].copy()
@@ -152,6 +144,29 @@ def process_yolo_keypoints_original(kps):
     scale_ref = np.linalg.norm((coords[5] + coords[6]) / 2.0) or 1.0
     coords /= scale_ref; coords[[13,14,15,16]] = 0.0
     return np.hstack([coords, confs]).flatten()
+
+def draw_overlay(img, objs, kps):
+    """이미지 위에 스티커 박스와 척추 라인을 그리는 함수"""
+    vis = img.copy()
+    pts = [o['center'] for o in objs]
+    
+    # 박스 및 번호 그리기
+    for i, o in enumerate(objs):
+        b = o['box']
+        cv2.rectangle(vis, (b[0], b[1]), (b[2], b[3]), (0, 255, 0), 2)
+        cv2.putText(vis, str(i+1), (b[0], b[1]-5), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
+    
+    # 라인 연결 (척추선)
+    if len(pts) >= 2:
+        for i in range(len(pts)-1):
+            cv2.line(vis, pts[i], pts[i+1], (255, 255, 0), 2)
+            
+    return vis, pts
+
+def angle_between(v1, v2):
+    n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
+    if n1 == 0 or n2 == 0: return 0.0
+    return float(np.degrees(np.arccos(np.clip(np.dot(v1, v2)/(n1*n2), -1.0, 1.0))))
 
 @st.cache_resource
 def load_all_models():
@@ -165,18 +180,26 @@ def load_all_models():
     return pm, am, ['Sitting (Ready)', 'Forward_Bending', 'Back_Extension', 'Side_Bending', 'Rotation'], sp
 
 # ==========================================
-# 5. WebRTC 콜백
+# 4. WebRTC 콜백
 # ==========================================
 try:
     pm_global, am_global, names_global, sp_global = load_all_models()
-except Exception as e:
-    st.error(f"모델 초기화 실패: {e}"); st.stop()
+except Exception as e: st.error(f"Error: {e}"); st.stop()
 
 def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
     img = frame.to_ndarray(format="bgr24")
+    
+    # 1. 캡처용 프레임 저장 (최신 프레임 유지)
+    try:
+        if st.session_state.img_queue.full():
+            st.session_state.img_queue.get_nowait()
+        st.session_state.img_queue.put(img)
+    except: pass
+    
+    # 2. 실시간 Pose 추론
     res = pm_global(img, verbose=False, conf=0.1)
     kps = None
-    action_text = "No Pose"
+    action_text = "Wait..."
     
     if res[0].keypoints is not None and len(res[0].keypoints.data) > 0:
         kps = res[0].keypoints.data[0].cpu().numpy()
@@ -190,104 +213,71 @@ def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
             if st.session_state.result_queue.full(): st.session_state.result_queue.get_nowait()
             st.session_state.result_queue.put({'kps': kps, 'action': action_text})
     except: pass
+    
     return frame
 
 # ==========================================
-# 6. UI 구성
+# 5. UI Layout
 # ==========================================
 col_main, col_ctrl = st.columns([1.6, 0.4])
 
 with col_ctrl:
     st.header("⚙️ 제어 패널")
     
-    # 소스 선택
-    input_source = st.radio("입력 소스", ["Webcam", "Video File"])
-    
-    if st.button("🛠 모델 상태 확인", use_container_width=True):
-        if sp_global and sp_global.model:
-            st.success(f"로드 성공 ({sp_global.method})")
-        else:
-            st.error(f"실패: {st.session_state.load_error}")
+    # 측정 기능 (스냅샷 & 오버레이)
+    if st.button("📸 Cobb 각도 측정 (Side Baseline)", type="primary", use_container_width=True):
+        if not st.session_state.img_queue.empty():
+            # 1. 큐에서 이미지 꺼내기
+            capture_img = st.session_state.img_queue.get()
             
-    st.divider()
-    
-    # 측정 버튼 (원본 기능 복구)
-    if st.button("📸 Cobb 각도 (Side Baseline)", use_container_width=True):
-        if st.session_state['last_kps'] is not None:
-            kps = st.session_state['last_kps']
-            # Cloud에서는 이미지 위에 그리는 대신 계산값 출력으로 대체
-            angle = np.degrees(np.arctan2(kps[0][1]-kps[12][1], kps[0][0]-kps[12][0]))
-            st.info(f"Side Baseline 저장됨 (임시 각도: {abs(angle):.1f}°)")
-        else: st.warning("데이터 없음")
+            # 2. Pose & Sticker 추론
+            res = pm_global(capture_img, verbose=False, conf=0.1)
+            if res[0].keypoints is not None:
+                kps = res[0].keypoints.data[0].cpu().numpy()
+                objs, success = sp_global.get_spine_points(capture_img, kps)
+                
+                if success:
+                    # 3. 그림 그리기 (Overlay)
+                    vis_img, pts = draw_overlay(capture_img, objs, kps)
+                    
+                    # 4. 각도 계산 (예시)
+                    v_spine = np.array(pts[0]) - np.array(pts[-1])
+                    st.session_state['side_baseline'] = v_spine
+                    
+                    # 5. 결과 저장 (이미지 BGR -> RGB 변환)
+                    st.session_state['snapshot_img'] = cv2.cvtColor(vis_img, cv2.COLOR_BGR2RGB)
+                    st.session_state['snapshot_info'] = "Cobb 각도: 기준선 저장됨"
+                else:
+                    st.error("스티커 인식 실패")
+            else:
+                st.error("사람 인식 실패")
+        else:
+            st.warning("카메라 영상이 없습니다.")
 
-    if st.button("📏 회전 기준각 (Rot Baseline)", use_container_width=True):
-         if st.session_state['last_kps'] is not None:
-             st.info("회전 기준각 저장됨")
-         else: st.warning("데이터 없음")
+    st.markdown("---")
+    # 결과 보여주기
+    if st.session_state['snapshot_img'] is not None:
+        st.image(st.session_state['snapshot_img'], caption=st.session_state.get('snapshot_info', '결과'))
+        
+    st.divider()
+    st.caption("현재 동작:")
+    status_ph = st.empty()
+
 
 with col_main:
-    st.subheader("🎥 분석 화면")
+    st.subheader("🎥 실시간 모니터링")
+    webrtc_streamer(
+        key="pose-overlay",
+        mode=WebRtcMode.SENDRECV,
+        rtc_configuration=RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}),
+        video_frame_callback=video_frame_callback,
+        media_stream_constraints={"video": True, "audio": False},
+        async_processing=True,
+    )
     
-    if input_source == "Webcam":
-        webrtc_streamer(
-            key="pose-analysis",
-            mode=WebRtcMode.SENDRECV,
-            rtc_configuration=RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}),
-            video_frame_callback=video_frame_callback,
-            media_stream_constraints={"video": True, "audio": False},
-            async_processing=True,
-        )
-        
-        # 실시간 결과 표시 (WebRTC 큐 사용)
-        placeholder = st.empty()
-        if st.session_state.result_queue.not_empty:
-            try:
-                data = st.session_state.result_queue.get_nowait()
-                st.session_state['last_kps'] = data['kps']
-                st.session_state['last_action'] = data['action']
-            except: pass
-        placeholder.info(f"현재 동작: **{st.session_state['last_action']}**")
-
-    elif input_source == "Video File":
-        # 동영상 파일 처리 로직 (원본 기능 복구)
-        video_file = st.file_uploader("동영상 업로드", type=['mp4', 'mov', 'avi'])
-        if video_file:
-            tfile = tempfile.NamedTemporaryFile(delete=False)
-            tfile.write(video_file.read())
-            
-            if st.button("▶ 영상 분석 시작"):
-                cap = cv2.VideoCapture(tfile.name) # cv2는 여기서만 로컬 변수로 사용 필요
-                # 하지만 cv2 import가 없으므로 opencv-python-headless가 설치되어 있다면
-                # import cv2를 함수 안에서 시도해야 함.
-                try:
-                    import cv2
-                    cap = cv2.VideoCapture(tfile.name)
-                    st_frame = st.empty()
-                    st_info = st.empty()
-                    
-                    while cap.isOpened():
-                        ret, frame = cap.read()
-                        if not ret: break
-                        
-                        # Pose 추론
-                        res = pm_global(frame, verbose=False, conf=0.1)
-                        if res[0].keypoints is not None and len(res[0].keypoints.data) > 0:
-                            kps = res[0].keypoints.data[0].cpu().numpy()
-                            st.session_state['last_kps'] = kps
-                            
-                            # Action 추론
-                            feat = process_yolo_keypoints_original(kps)
-                            input_data = np.tile(np.expand_dims(feat, axis=0), (1, 30, 1))
-                            pred = am_global.predict(input_data, verbose=0)
-                            act = names_global[np.argmax(pred)]
-                            
-                            # 시각화 (CV2 drawing -> RGB -> Streamlit)
-                            for i, p in enumerate(kps):
-                                cv2.circle(frame, (int(p[0]), int(p[1])), 5, (0, 255, 0), -1)
-                            st_info.markdown(f"**Action: {act}**")
-                        
-                        st_frame.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), channels="RGB")
-                        time.sleep(0.03) # 프레임 속도 조절
-                    cap.release()
-                except ImportError:
-                    st.error("OpenCV가 설치되지 않았습니다. requirements.txt를 확인하세요.")
+    # 실시간 상태 텍스트 업데이트
+    if st.session_state.result_queue.not_empty:
+        try:
+            data = st.session_state.result_queue.get_nowait()
+            status_ph.info(f"**{data['action']}**")
+        except: pass
