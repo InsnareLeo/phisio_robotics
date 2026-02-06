@@ -2,7 +2,11 @@ streamlit
 streamlit-webrtc
 opencv-python-headless
 ultralytics
-tensorflow-cpu
+tensorflow-cpu==2.15.0
 numpy
 pandas
 av
+scipy
+requests
+tqdm
+seaborn
